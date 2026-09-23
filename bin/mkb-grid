@@ -1,0 +1,954 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  [MKB-GRID] INFRASTRUCTURE CONTROL NODE                          ║
+# ║  Bespoke terminal UI for managing local Docker services. v4      ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+PREFIX="mkb_svc_"
+VOL_PREFIX="mkb_vol_"
+NET_PREFIX="mkb_net_"
+TAGS_FILE="${HOME}/.local/share/mkb-grid/tags.env"
+
+if ! command -v docker &> /dev/null; then
+    echo "Docker is required but not installed."
+    exit 1
+fi
+
+mkdir -p "$(dirname "$TAGS_FILE")"
+touch "$TAGS_FILE"
+
+# Colors via tput
+BOLD=$(tput bold)
+RED=$(tput setaf 1)
+GREEN=$(tput setaf 2)
+YELLOW=$(tput setaf 3)
+CYAN=$(tput setaf 6)
+DIM=$(tput dim)
+REV=$(tput rev)
+RESET=$(tput sgr0)
+
+# Trap
+cleanup() {
+    tput cnorm
+    tput sgr0
+    clear
+}
+trap cleanup EXIT INT TERM
+
+draw_header() {
+    clear
+    echo "${BOLD}╔══════════════════════════════════════════════════════════════╗${RESET}"
+    echo "${BOLD}║  [MKB-GRID] INFRASTRUCTURE CONTROL NODE                      ║${RESET}"
+    echo "${BOLD}╠══════════════════════════════════════════════════════════════╣${RESET}"
+}
+
+draw_footer() {
+    echo "${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}"
+}
+
+pause() {
+    echo -e "\n  ${DIM}Press [ENTER] to continue...${RESET}"
+    read_key >/dev/null 2>&1 || read -r
+}
+
+# Key reading
+ESC_KEY=$'\033'
+read_key() {
+  KEY=""
+  IFS= read -rsn1 byte
+  if [[ "$byte" == "$ESC_KEY" ]]; then
+    IFS= read -rsn2 -t 0.05 byte
+    case "$byte" in
+      "[A") KEY="UP" ;;
+      "[B") KEY="DOWN" ;;
+      *) KEY="ESC" ;;
+    esac
+  elif [[ "$byte" == "" ]]; then
+    KEY="ENTER"
+  else
+    KEY="$byte"
+  fi
+}
+
+select_menu() {
+    local -n _options=$1
+    local prompt=$2
+    local selected=0
+    local opt_count=${#_options[@]}
+    
+    tput civis
+    while true; do
+        draw_header
+        if [ -n "$prompt" ]; then
+            echo "║  $prompt"
+            echo "║"
+        fi
+        for i in "${!_options[@]}"; do
+            if [ "$i" -eq "$selected" ]; then
+                echo "${REV}${CYAN}${BOLD}║  ▸ ${_options[$i]}${RESET}"
+            else
+                echo "║    ${_options[$i]}"
+            fi
+        done
+        echo "║"
+        draw_footer
+        
+        read_key
+        case "$KEY" in
+            "UP") ((selected--)); [ "$selected" -lt 0 ] && selected=$((opt_count - 1)) ;;
+            "DOWN") ((selected++)); [ "$selected" -ge "$opt_count" ] && selected=0 ;;
+            "ENTER") MENU_RESULT=$selected; return 0 ;;
+            "ESC") MENU_RESULT=-1; return 1 ;;
+        esac
+    done
+}
+
+find_free_port() {
+  local port=$(echo "$1" | xargs)
+  while ss -tuln | grep -Eq ":$port\b" || docker ps --format '{{.Ports}}' | grep -Eq ":$port->"; do
+    port=$((port+1))
+  done
+  echo "$port"
+}
+
+get_tag() {
+  local name="$1"
+  grep "^${name}=" "$TAGS_FILE" 2>/dev/null | cut -d= -f2 | tail -n 1
+}
+
+set_tag() {
+  local name="$1"
+  local tag="$2"
+  sed -i "/^${name}=/d" "$TAGS_FILE"
+  [ -n "$tag" ] && echo "${name}=${tag}" >> "$TAGS_FILE"
+}
+
+# ─── CORE ACTIONS ────────────────────────────────────────────────
+
+services_dashboard() {
+  tput civis
+  while true; do
+      draw_header
+      echo "║  SERVICES DASHBOARD"
+      echo "║  Fetching data..."
+      
+      local count=$(docker ps -a --filter "name=^${PREFIX}" --format "{{.ID}}" | wc -l)
+      if [ "$count" -eq 0 ]; then
+        draw_header
+        echo "║  SERVICES DASHBOARD"
+        echo "║"
+        echo "║  [NO SERVICES RUNNING IN GRID]"
+        echo "║"
+        draw_footer
+        echo "${DIM}Press ESC or ENTER to return${RESET}"
+        read_key
+        return
+      fi
+
+      mapfile -t ALL_SVCS < <(docker ps -a --filter "name=^${PREFIX}" --format "{{.Names}}|{{.Status}}|{{.Ports}}|{{.ID}}")
+      
+      local selected=0
+      local opt_count=${#ALL_SVCS[@]}
+      
+      while true; do
+          draw_header
+          echo "║  SERVICES DASHBOARD"
+          echo "║"
+          printf "║    %-18s | %-10s | %-13s | %-15s\n" "NAME" "TAG" "STATUS" "PORTS"
+          echo "║  ─────────────────────┼────────────┼───────────────┼─────────────────"
+          
+          for i in "${!ALL_SVCS[@]}"; do
+              IFS='|' read -r name status ports id <<< "${ALL_SVCS[$i]}"
+              local clean_name=${name#$PREFIX}
+              local clean_ports=$(echo "$ports" | grep -o "[0-9]*->[0-9]*/tcp" | sed 's/\/tcp//g' | tr '\n' ',' | sed 's/,$//')
+              local tag=$(get_tag "$name")
+              [ -z "$tag" ] && tag="-"
+              
+              local status_disp="▲ running"
+              local status_color=$GREEN
+              if [[ "$status" == *"Exited"* || "$status" == *"Created"* ]]; then 
+                status_disp="▼ stopped"
+                status_color=$RED
+              fi
+              
+              if [ "$i" -eq "$selected" ]; then
+                  printf "${REV}${CYAN}${BOLD}║  ▸ %-18s | %-10s | %-13s | %-15s${RESET}\n" "${clean_name:0:18}" "${tag:0:10}" "${status_disp}" "${clean_ports:0:15}"
+              else
+                  printf "║    %-18s | %-10s | ${status_color}%-13s${RESET} | %-15s\n" "${clean_name:0:18}" "${tag:0:10}" "${status_disp}" "${clean_ports:0:15}"
+              fi
+          done
+          
+          echo "║"
+          draw_footer
+          echo "${DIM}UP/DOWN: Select | ENTER: Control Panel | ESC: Back${RESET}"
+          
+          read_key
+          case "$KEY" in
+              "UP") ((selected--)); [ "$selected" -lt 0 ] && selected=$((opt_count - 1)) ;;
+              "DOWN") ((selected++)); [ "$selected" -ge "$opt_count" ] && selected=0 ;;
+              "ENTER")
+                  IFS='|' read -r s_name _ _ _ <<< "${ALL_SVCS[$selected]}"
+                  service_control_panel "$s_name"
+                  break # Break inner loop to refresh data
+                  ;;
+              "ESC") return ;;
+          esac
+      done
+  done
+}
+
+service_control_panel() {
+  local target="$1"
+  
+  while true; do
+      if ! docker ps -a --format '{{.Names}}' | grep -Eq "^${target}$"; then
+          return # Service was deleted
+      fi
+      
+      local envs=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$target")
+      local ports=$(docker inspect --format '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{end}}{{end}}' "$target" | tr '\n' ' ' | awk '{print $1}')
+      local image=$(docker inspect --format '{{.Config.Image}}' "$target")
+      local limits=$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$target")
+      local is_running=$(docker inspect --format '{{.State.Running}}' "$target")
+      local networks=$(docker inspect --format '{{range $net, $conf := .NetworkSettings.Networks}}{{$net}} ({{$conf.IPAddress}}) {{end}}' "$target" 2>/dev/null)
+      local volumes=$(docker inspect --format '{{range .Mounts}}{{println .Source}}{{end}}' "$target" | grep 'mkb-grid/volumes' | awk -F/ '{print $NF}' | head -n 1)
+      
+      local cpus=$(echo $limits | awk '{print $1 / 1000000000}')
+      local mem=$(echo $limits | awk '{print $2 / 1048576}')
+      [ "$cpus" == "0" ] && cpus="UNLIMITED" || cpus="${cpus}c"
+      [ "$mem" == "0" ] && mem="UNLIMITED" || mem="${mem}m"
+      
+      local status_text="▼ stopped"
+      local status_color=$RED
+      if [ "$is_running" == "true" ]; then
+          status_text="▲ running"
+          status_color=$GREEN
+      fi
+      
+      local tag=$(get_tag "$target")
+      
+      local db_user=""
+      local db_pass=""
+      local db_name=""
+      local conn_url=""
+      
+      if [[ "$image" == *"postgres"* ]]; then
+        db_user=$(echo "$envs" | grep '^POSTGRES_USER=' | cut -d= -f2)
+        db_pass=$(echo "$envs" | grep '^POSTGRES_PASSWORD=' | cut -d= -f2)
+        db_name=$(echo "$envs" | grep '^POSTGRES_DB=' | cut -d= -f2)
+        conn_url="postgresql://${db_user}:${db_pass}@localhost:${ports}/${db_name}"
+      elif [[ "$image" == *"mysql"* ]] || [[ "$image" == *"mariadb"* ]]; then
+        db_user="root"
+        db_pass=$(echo "$envs" | grep '^MYSQL_ROOT_PASSWORD=' | cut -d= -f2)
+        db_name=$(echo "$envs" | grep '^MYSQL_DATABASE=' | cut -d= -f2)
+        conn_url="mysql://${db_user}:${db_pass}@localhost:${ports}/${db_name}"
+      elif [[ "$image" == *"mongo"* ]]; then
+        db_user=$(echo "$envs" | grep '^MONGO_INITDB_ROOT_USERNAME=' | cut -d= -f2)
+        db_pass=$(echo "$envs" | grep '^MONGO_INITDB_ROOT_PASSWORD=' | cut -d= -f2)
+        conn_url="mongodb://${db_user}:${db_pass}@localhost:${ports}/"
+      elif [[ "$image" == *"redis"* ]]; then
+        conn_url="redis://localhost:${ports}"
+      elif [[ "$image" == *"rabbitmq"* ]]; then
+        db_user=$(echo "$envs" | grep '^RABBITMQ_DEFAULT_USER=' | cut -d= -f2)
+        db_pass=$(echo "$envs" | grep '^RABBITMQ_DEFAULT_PASS=' | cut -d= -f2)
+        conn_url="amqp://${db_user}:${db_pass}@localhost:${ports}"
+      elif [[ "$image" == *"kafka"* ]]; then
+        conn_url="localhost:${ports}"
+      else
+        conn_url="http://localhost:${ports}"
+      fi
+      
+      draw_header
+      echo "║  SERVICE: ${CYAN}${target#$PREFIX}${RESET}                    [Tag: ${YELLOW}${tag:-None}${RESET}]"
+      echo "║"
+      printf "║  Image:    %-28s Status: %s%s%s\n" "$image" "$status_color" "$status_text" "$RESET"
+      printf "║  Port:     %-28s CPU: %s | RAM: %s\n" "${ports:-N/A}" "$cpus" "$mem"
+      echo "║  Network:  ${networks:-None}"
+      echo "║  Volume:   ${volumes:-None}"
+      echo "║"
+      echo "║  Connection: ${GREEN}${conn_url}${RESET}"
+      echo "║"
+      echo "║  ──────────────────────────────────────────────────────────"
+      echo "║  [STATE]                  [DATA]"
+      echo "║  s) Start / Restart       b) Backup Volume"
+      echo "║  x) Stop                  c) Clone (Branch)"
+      echo "║  d) Delete                w) Wipe (DESTROY)"
+      echo "║"
+      echo "║  [CONFIG]                 [DEBUG]"
+      echo "║  t) Edit Tag              l) Tail Logs"
+      echo "║  r) Resources (CPU/RAM)   n) Networks"
+      echo "║"
+      draw_footer
+      echo "${DIM}Press letter key to action, ESC to back${RESET}"
+      
+      read_key
+      case "$KEY" in
+          "s") 
+              echo "  Restarting..."
+              docker restart "$target" >/dev/null 2>&1 && echo "  ${GREEN}[OK] Restarted.${RESET}" || echo "  ${RED}[ERROR] Failed.${RESET}"
+              pause ;;
+          "x")
+              docker stop "$target" >/dev/null 2>&1 && echo "  ${GREEN}[OK] Stopped.${RESET}" || echo "  ${RED}[ERROR] Failed.${RESET}"
+              pause ;;
+          "d")
+              tput cnorm
+              read -p "  Delete container ${target#$PREFIX}? Data is preserved. [y/N]: " confirm_del
+              if [[ "$confirm_del" =~ ^[Yy]$ ]]; then
+                docker rm -f "$target" >/dev/null 2>&1
+                set_tag "$target" ""
+                echo "  ${GREEN}[OK] Container deleted.${RESET}"
+                pause
+                return
+              fi
+              ;;
+          "w") wipe_service "$target" && return || true ;;
+          "b") backup_volume "$target" ;;
+          "c") branch_service "$target" ;;
+          "t") 
+              tput cnorm
+              echo "  Current tag: ${YELLOW}${tag:-None}${RESET}"
+              read -p "  Enter new tag (leave blank to remove): " new_tag
+              set_tag "$target" "$new_tag"
+              echo "  ${GREEN}[OK] Tag updated.${RESET}"
+              pause
+              ;;
+          "r") update_resources "$target" ;;
+          "l") tput cnorm; clear; echo "${BOLD}--- Tailing logs for ${target#$PREFIX} (Ctrl+C to exit) ---${RESET}"; docker logs -f --tail 100 "$target" ;;
+          "n") network_attach_detach "$target" ;;
+          "ESC"|"q") return ;;
+      esac
+  done
+}
+
+network_attach_detach() {
+    local target="$1"
+    mapfile -t _net_opts < <(docker network ls --filter "name=^${NET_PREFIX}" --format "{{.Name}}")
+    _net_opts+=("Detach from all" "Cancel")
+    
+    select_menu _net_opts "Select Network to Attach/Detach for $target:"
+    if [ "$MENU_RESULT" -ge 0 ]; then
+        local sel="${_net_opts[$MENU_RESULT]}"
+        if [ "$sel" == "Cancel" ]; then return; fi
+        if [ "$sel" == "Detach from all" ]; then
+            local attached=$(docker inspect --format '{{range $net, $conf := .NetworkSettings.Networks}}{{$net}} {{end}}' "$target" 2>/dev/null)
+            for n in $attached; do
+                docker network disconnect "$n" "$target" 2>/dev/null
+            done
+            return
+        fi
+        docker network connect "$sel" "$target" 2>/dev/null || docker network disconnect "$sel" "$target" 2>/dev/null
+    fi
+}
+
+deploy_service() {
+  local options=(
+    "[DATABASES] PostgreSQL (16-alpine)"
+    "[DATABASES] MySQL (8.0)"
+    "[DATABASES] MongoDB (7)"
+    "[DATABASES] Redis (7-alpine)"
+    "[MESSAGE BROKERS] Kafka (KRaft 3.7)"
+    "[MESSAGE BROKERS] RabbitMQ (3-management)"
+    "[CUSTOM] Enter custom image..."
+    "Cancel"
+  )
+  
+  select_menu options "DEPLOY NEW SERVICE - Choose Type:"
+  if [ "$MENU_RESULT" -lt 0 ]; then return; fi
+  
+  local svc_choice=$((MENU_RESULT + 1))
+  if [ "$svc_choice" -eq 8 ]; then return; fi
+
+  tput cnorm
+  draw_header
+  echo "║  DEPLOY CONFIGURATION"
+  echo "║"
+  
+  local image=""
+  local name_suffix=""
+  local port_ext=""
+  local port_int=""
+  local env_vars=""
+  local custom_cmd=""
+  local db_pass=""
+
+  case $svc_choice in
+    1)
+      image="postgres:16-alpine"
+      name_suffix="postgres"
+      port_int="5432"
+      local default_port=$(find_free_port 5432)
+      read -p "  Enter Host Port [default $default_port]: " port_ext
+      port_ext=${port_ext:-$default_port}
+      read -p "  Enter Root Password [default 'password']: " db_pass
+      db_pass=${db_pass:-password}
+      env_vars="-e POSTGRES_USER=root -e POSTGRES_PASSWORD=${db_pass} -e POSTGRES_DB=markab_db"
+      ;;
+    2)
+      image="mysql:8.0"
+      name_suffix="mysql"
+      port_int="3306"
+      local default_port=$(find_free_port 3306)
+      read -p "  Enter Host Port [default $default_port]: " port_ext
+      port_ext=${port_ext:-$default_port}
+      read -p "  Enter Root Password [default 'password']: " db_pass
+      db_pass=${db_pass:-password}
+      env_vars="-e MYSQL_ROOT_PASSWORD=${db_pass} -e MYSQL_DATABASE=markab_db"
+      ;;
+    3)
+      image="mongo:7"
+      name_suffix="mongo"
+      port_int="27017"
+      local default_port=$(find_free_port 27017)
+      read -p "  Enter Host Port [default $default_port]: " port_ext
+      port_ext=${port_ext:-$default_port}
+      read -p "  Enter Root Password [default 'password']: " db_pass
+      db_pass=${db_pass:-password}
+      env_vars="-e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD=${db_pass}"
+      ;;
+    4)
+      image="redis:7-alpine"
+      name_suffix="redis"
+      port_int="6379"
+      local default_port=$(find_free_port 6379)
+      read -p "  Enter Host Port [default $default_port]: " port_ext
+      port_ext=${port_ext:-$default_port}
+      custom_cmd="redis-server --save 60 1 --loglevel warning"
+      ;;
+    5)
+      image="apache/kafka:3.7.0"
+      name_suffix="kafka"
+      port_int="9092"
+      local default_port=$(find_free_port 9092)
+      read -p "  Enter Host Port [default $default_port]: " port_ext
+      port_ext=${port_ext:-$default_port}
+      env_vars="-e KAFKA_CFG_NODE_ID=1 -e KAFKA_CFG_PROCESS_ROLES=controller,broker -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 -e KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:${port_ext}"
+      ;;
+    6)
+      image="rabbitmq:3-management-alpine"
+      name_suffix="rabbitmq"
+      port_int="5672"
+      local default_port=$(find_free_port 5672)
+      read -p "  Enter Host Port [default $default_port]: " port_ext
+      port_ext=${port_ext:-$default_port}
+      read -p "  Enter Admin/Pass [default 'admin']: " db_pass
+      db_pass=${db_pass:-admin}
+      env_vars="-e RABBITMQ_DEFAULT_USER=${db_pass} -e RABBITMQ_DEFAULT_PASS=${db_pass}"
+      ;;
+    7)
+      echo "  Examples: n8nio/n8n, nginx:alpine, grafana/grafana"
+      read -p "  Enter Docker Image: " image
+      if [ -z "$image" ]; then echo "  Image required."; pause; return; fi
+      read -p "  Enter Custom Name (e.g. myweb): " name_suffix
+      if [ -z "$name_suffix" ]; then name_suffix="custom"; fi
+      read -p "  Enter Container Internal Port (e.g. 80): " port_int
+      if [ -z "$port_int" ]; then port_int="80"; fi
+      local default_port=$(find_free_port 8080)
+      read -p "  Enter External Host Port (default $default_port): " port_ext
+      if [ -z "$port_ext" ]; then port_ext="$default_port"; fi
+      ;;
+  esac
+
+  local default_name="${name_suffix}_${port_ext}"
+  read -p "  Enter Container Name [default $default_name]: " custom_name
+  custom_name=${custom_name:-$default_name}
+  read -p "  Enter Project Tag [Leave blank for none]: " proj_tag
+  read -p "  Enter CPU Limit (e.g. 1.0, 0.5) [default UNLIMITED]: " limit_cpu
+  read -p "  Enter RAM Limit (e.g. 512m, 1g) [default UNLIMITED]: " limit_ram
+
+  local container_name="${PREFIX}${custom_name}"
+  if docker ps -a --format '{{.Names}}' | grep -Eq "^${container_name}\$"; then
+    echo "  [ERROR] Service ${container_name} already exists!"
+    pause
+    return
+  fi
+
+  # Network selection
+  tput civis
+  mapfile -t NET_LIST < <(docker network ls --filter "name=^${NET_PREFIX}" --format "{{.Name}}")
+  local net_options=("None (default bridge)" "Create new network...")
+  for n in "${NET_LIST[@]}"; do
+      local c_count=$(docker network inspect -f '{{len .Containers}}' "$n" 2>/dev/null)
+      net_options+=("$n    [$c_count containers]")
+  done
+  
+  select_menu net_options "Select Network for $container_name:"
+  local net_args=""
+  if [ "$MENU_RESULT" -eq 1 ]; then
+      tput cnorm
+      read -p "  Enter new network name suffix (e.g. 'backend'): " n_suffix
+      if [ -n "$n_suffix" ]; then
+          docker network create "${NET_PREFIX}${n_suffix}" >/dev/null
+          net_args="--network ${NET_PREFIX}${n_suffix}"
+          [ -n "$proj_tag" ] && set_tag "${NET_PREFIX}${n_suffix}" "$proj_tag"
+      fi
+  elif [ "$MENU_RESULT" -gt 1 ]; then
+      local exact_net="${NET_LIST[$((MENU_RESULT-2))]}"
+      net_args="--network $exact_net"
+  fi
+
+  draw_header
+  echo "║  Booting ${container_name}..."
+  
+  local vol_mount=""
+  if [ "$svc_choice" != "7" ]; then
+    local volume_name="${VOL_PREFIX}${custom_name}_data"
+    local btrfs_path="${HOME}/.local/share/mkb-grid/volumes/${volume_name}"
+    mkdir -p "${HOME}/.local/share/mkb-grid/volumes"
+    btrfs subvolume create "$btrfs_path" >/dev/null 2>&1 || true
+    
+    if [ "$name_suffix" == "postgres" ]; then vol_mount="-v ${btrfs_path}:/var/lib/postgresql/data"
+    elif [ "$name_suffix" == "mysql" ]; then vol_mount="-v ${btrfs_path}:/var/lib/mysql"
+    elif [ "$name_suffix" == "mongo" ]; then vol_mount="-v ${btrfs_path}:/data/db"
+    elif [ "$name_suffix" == "redis" ]; then vol_mount="-v ${btrfs_path}:/data"
+    elif [ "$name_suffix" == "kafka" ]; then vol_mount="-v ${btrfs_path}:/bitnami/kafka"
+    elif [ "$name_suffix" == "rabbitmq" ]; then vol_mount="-v ${btrfs_path}:/var/lib/rabbitmq"
+    fi
+  fi
+
+  local port_mapping="-p ${port_ext}:${port_int}"
+  if [ "$name_suffix" == "rabbitmq" ]; then
+    port_mapping="${port_mapping} -p 1${port_ext}:15672"
+  fi
+
+  local limit_args=""
+  if [ -n "$limit_cpu" ]; then limit_args="${limit_args} --cpus=${limit_cpu}"; fi
+  if [ -n "$limit_ram" ]; then limit_args="${limit_args} --memory=${limit_ram}"; fi
+
+  eval "docker run -d --name \"$container_name\" --restart unless-stopped $port_mapping $limit_args $net_args $vol_mount $env_vars \"$image\" $custom_cmd >/dev/null"
+  [ -n "$proj_tag" ] && set_tag "$container_name" "$proj_tag"
+
+  echo "║  [SUCCESS] Service deployed and running."
+  pause
+  service_control_panel "$container_name"
+}
+
+manage_networks() {
+    while true; do
+        draw_header
+        echo "║  NETWORKS & TOPOLOGY"
+        echo "║"
+        printf "║  %-25s | %-15s | %s\n" "NETWORK NAME" "TAG" "CONTAINERS"
+        echo "║  ──────────────────────────┼─────────────────┼────────────"
+        
+        local count=$(docker network ls --filter "name=^${NET_PREFIX}" --format "{{.ID}}" | wc -l)
+        if [ "$count" -eq 0 ]; then
+            echo "║  [NO CUSTOM NETWORKS FOUND]"
+        else
+            docker network ls --filter "name=^${NET_PREFIX}" --format "{{.Name}}" | while read -r net_name; do
+                local attached_count=$(docker network inspect -f '{{len .Containers}}' "$net_name" 2>/dev/null)
+                local tag=$(get_tag "$net_name")
+                printf "║  %-25s | %-15s | %d\n" "${net_name:0:25}" "${tag:0:15}" "$attached_count"
+            done
+        fi
+        echo "║"
+        draw_footer
+        echo "${DIM}Actions: c)reate, d)elete, a)ttach, x)detach, t)ag, p)anorama logs, ESC) back${RESET}"
+        
+        read_key
+        case "$KEY" in
+            "c")
+                tput cnorm
+                read -p "  Enter new network name suffix: " n_suffix
+                read -p "  Enter Project Tag: " p_tag
+                if [ -n "$n_suffix" ]; then
+                    docker network create "${NET_PREFIX}${n_suffix}" >/dev/null
+                    [ -n "$p_tag" ] && set_tag "${NET_PREFIX}${n_suffix}" "$p_tag"
+                fi
+                tput civis
+                ;;
+            "d")
+                mapfile -t NET_LIST < <(docker network ls --filter "name=^${NET_PREFIX}" --format "{{.Name}}")
+                select_menu NET_LIST "Select Network to Delete:"
+                if [ "$MENU_RESULT" -ge 0 ]; then
+                    docker network rm "${NET_LIST[$MENU_RESULT]}" >/dev/null 2>&1 || { echo "Failed to delete"; pause; }
+                fi
+                ;;
+            "a"|"x")
+                local net_action="$KEY"
+                mapfile -t SVC_LIST < <(docker ps -a --filter "name=^${PREFIX}" --format "{{.Names}}")
+                if [ ${#SVC_LIST[@]} -eq 0 ]; then echo "  No services found."; pause; continue; fi
+                select_menu SVC_LIST "Select Service:"
+                if [ "$MENU_RESULT" -ge 0 ]; then
+                    local target="${SVC_LIST[$MENU_RESULT]}"
+                    mapfile -t NET_LIST < <(docker network ls --filter "name=^${NET_PREFIX}" --format "{{.Name}}")
+                    if [ ${#NET_LIST[@]} -eq 0 ]; then echo "  No networks found."; pause; continue; fi
+                    select_menu NET_LIST "Select Network:"
+                    if [ "$MENU_RESULT" -ge 0 ]; then
+                        if [ "$net_action" == "a" ]; then
+                            docker network connect "${NET_LIST[$MENU_RESULT]}" "$target" 2>/dev/null && echo "  [OK] Attached." || echo "  [ERROR] Already connected?"
+                        else
+                            docker network disconnect "${NET_LIST[$MENU_RESULT]}" "$target" 2>/dev/null && echo "  [OK] Detached." || echo "  [ERROR] Not connected?"
+                        fi
+                        pause
+                    fi
+                fi
+                ;;
+            "t")
+                mapfile -t NET_LIST < <(docker network ls --filter "name=^${NET_PREFIX}" --format "{{.Name}}")
+                select_menu NET_LIST "Select Network to Tag:"
+                if [ "$MENU_RESULT" -ge 0 ]; then
+                    tput cnorm
+                    read -p "  Enter new tag: " n_tag
+                    set_tag "${NET_LIST[$MENU_RESULT]}" "$n_tag"
+                    tput civis
+                fi
+                ;;
+            "p")
+                mapfile -t NET_LIST < <(docker network ls --filter "name=^${NET_PREFIX}" --format "{{.Name}}")
+                select_menu NET_LIST "Select Network for Panorama Logs:"
+                if [ "$MENU_RESULT" -ge 0 ]; then
+                    local net_name="${NET_LIST[$MENU_RESULT]}"
+                    local containers=$(docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' "$net_name" 2>/dev/null)
+                    if [ -n "$containers" ]; then
+                        clear
+                        echo -e "${BOLD}--- PANORAMA: Tailing logs for network '$net_name' ---${RESET}"
+                        trap 'kill $(jobs -p) 2>/dev/null; return' SIGINT
+                        local color_idx=1
+                        local colors=("${GREEN}" "${CYAN}" "${YELLOW}" "${BOLD}" "${RED}")
+                        for c in $containers; do
+                            local c_color="${colors[$((color_idx % 5))]}"
+                            docker logs -f --tail 20 "$c" 2>&1 | while read -r line; do
+                                echo -e "${c_color}[$c]${RESET} $line"
+                            done &
+                            ((color_idx++))
+                        done
+                        wait
+                        trap cleanup EXIT INT TERM
+                    fi
+                fi
+                ;;
+            "ESC") return ;;
+        esac
+    done
+}
+
+update_resources() {
+  local target="$1"
+  local limits=$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$target")
+  local cpus=$(echo $limits | awk '{print $1 / 1000000000}')
+  local mem=$(echo $limits | awk '{print $2 / 1048576}')
+  [ "$cpus" == "0" ] && cpus="UNLIMITED" || cpus="${cpus}c"
+  [ "$mem" == "0" ] && mem="UNLIMITED" || mem="${mem}m"
+  
+  tput cnorm
+  echo "║"
+  echo "║  Current Limits -> CPU: $cpus | RAM: $mem"
+  read -p "  Enter NEW CPU Limit (e.g. 1.0) [Blank to keep]: " new_cpu
+  read -p "  Enter NEW RAM Limit (e.g. 512m) [Blank to keep]: " new_mem
+  
+  local args=""
+  [ -n "$new_cpu" ] && args="$args --cpus=$new_cpu"
+  [ -n "$new_mem" ] && args="$args --memory=$new_mem"
+  
+  if [ -n "$args" ]; then
+      docker update $args "$target" >/dev/null
+  fi
+  tput civis
+}
+
+backup_volume() {
+  local target="$1"
+  local mount_source=$(docker inspect --format '{{range .Mounts}}{{println .Source}}{{end}}' "$target" | grep 'mkb-grid/volumes' | head -n 1)
+  if [ -z "$mount_source" ]; then
+    echo "║  [ERROR] This service does not use a BTRFS volume."
+    pause
+    return
+  fi
+  
+  local timestamp=$(date +%Y%m%d_%H%M%S)
+  local dest_path="${HOME}/Downloads/${target}_backup_${timestamp}.tar.gz"
+  
+  echo "║  Creating BTRFS snapshot and compressing..."
+  local snap_tmp="${mount_source}_tmp_backup_${timestamp}"
+  sudo btrfs subvolume snapshot -r "$mount_source" "$snap_tmp" >/dev/null
+  sudo tar -czf "$dest_path" -C "$snap_tmp" .
+  sudo btrfs subvolume delete "$snap_tmp" >/dev/null
+  sudo chown $(id -u):$(id -g) "$dest_path"
+  
+  echo "║  [SUCCESS] Saved to $dest_path"
+  pause
+}
+
+branch_service() {
+  local target="$1"
+  local mount_source=$(docker inspect --format '{{range .Mounts}}{{println .Source}}{{end}}' "$target" | grep 'mkb-grid/volumes' | head -n 1)
+  if [ -z "$mount_source" ]; then
+    echo "║  [ERROR] No BTRFS volume to branch."
+    pause
+    return
+  fi
+  
+  tput cnorm
+  read -p "  Enter branch suffix (e.g., 'feature-x'): " branch_suffix
+  if [ -z "$branch_suffix" ]; then tput civis; return; fi
+  
+  local image=$(docker inspect --format '{{.Config.Image}}' "$target")
+  local env_args=""
+  while IFS= read -r env_line; do
+    if [[ "$env_line" != PATH=* ]] && [[ "$env_line" != HOSTNAME=* ]] && [[ -n "$env_line" ]]; then
+      env_args="$env_args -e \"$env_line\""
+    fi
+  done < <(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$target")
+  
+  local limits=$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$target")
+  local limit_cpus=$(echo $limits | awk '{print $1}')
+  local limit_mem=$(echo $limits | awk '{print $2}')
+  
+  local port_args=""
+  while IFS= read -r port_binding; do
+    if [ -n "$port_binding" ]; then
+      local int_p=$(echo "$port_binding" | cut -d'|' -f1 | cut -d/ -f1 | xargs)
+      local ext_p=$(echo "$port_binding" | cut -d'|' -f2 | xargs)
+      local default_port=$(find_free_port "$ext_p")
+      read -p "  Map internal port $int_p to new Host Port [default $default_port]: " new_ext_p
+      new_ext_p=${new_ext_p:-$default_port}
+      port_args="$port_args -p ${new_ext_p}:${int_p}"
+    fi
+  done < <(docker inspect --format '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{println $p "|" (index $conf 0).HostPort}}{{end}}{{end}}' "$target")
+  
+  local custom_cmd=$(docker inspect --format '{{range .Config.Cmd}}{{print . " "}}{{end}}' "$target")
+  local base_name=$(echo "$target" | sed -E 's/_[0-9]+$//' | sed "s/^$PREFIX//")
+  local default_name="${base_name}_${branch_suffix}"
+  read -p "  Enter new Container Name [default $default_name]: " custom_name
+  custom_name=${custom_name:-$default_name}
+  local new_container_name="${PREFIX}${custom_name}"
+  
+  if docker ps -a --format '{{.Names}}' | grep -Eq "^${new_container_name}\$"; then
+    echo "║  [ERROR] Already exists!"; pause; tput civis; return
+  fi
+  
+  local new_vol_name="${new_container_name#$PREFIX}_data"
+  local new_btrfs_path="${HOME}/.local/share/mkb-grid/volumes/${new_vol_name}"
+  
+  sudo btrfs subvolume snapshot "$mount_source" "$new_btrfs_path" >/dev/null
+  
+  local limit_args=""
+  if [ "$limit_cpus" != "0" ]; then limit_args="${limit_args} --cpus=$(echo $limit_cpus | awk '{print $1 / 1000000000}')"; fi
+  if [ "$limit_mem" != "0" ]; then limit_args="${limit_args} --memory=${limit_mem}"; fi
+  
+  local vol_target=$(docker inspect --format '{{range .Mounts}}{{printf "%s|%s\n" .Source .Destination}}{{end}}' "$target" | grep 'mkb-grid/volumes' | cut -d'|' -f2 | head -n 1)
+  vol_target="${vol_target#"${vol_target%%[![:space:]]*}"}"
+  vol_target="${vol_target%"${vol_target##*[![:space:]]}"}"
+  
+  local run_cmd="docker run -d --name \"$new_container_name\" --restart unless-stopped $port_args $limit_args -v \"${new_btrfs_path}:${vol_target}\" $env_args \"$image\" $custom_cmd"
+  eval $run_cmd >/dev/null
+  
+  local p_tag=$(get_tag "$target")
+  [ -n "$p_tag" ] && set_tag "$new_container_name" "$p_tag"
+  
+  echo "║  [SUCCESS] Branch created."
+  pause
+  tput civis
+}
+
+wipe_service() {
+  local target="$1"
+  tput cnorm
+  echo -e "║  ${RED}WARNING: This will DESTROY all data in $target!${RESET}"
+  read -p "  Type 'DESTROY' to confirm: " confirm
+  if [ "$confirm" == "DESTROY" ]; then
+    docker stop "$target" >/dev/null
+    docker rm "$target" >/dev/null
+    local vol_name=$(echo "$target" | sed "s/^$PREFIX/$VOL_PREFIX/")_data
+    local btrfs_path="${HOME}/.local/share/mkb-grid/volumes/${vol_name}"
+    docker volume rm "$vol_name" >/dev/null 2>&1 || true
+    if [ -d "$btrfs_path" ]; then
+      sudo rm -rf "$btrfs_path"
+    fi
+    set_tag "$target" ""
+  fi
+  tput civis
+}
+
+search_filter() {
+  tput cnorm
+  draw_header
+  echo "║  SEARCH / FILTER"
+  echo "║"
+  read -p "  Enter keyword: " keyword
+  if [ -z "$keyword" ]; then tput civis; return; fi
+  
+  echo "║"
+  echo "║  [MATCHING CONTAINERS]"
+  local found_c=0
+  docker ps -a --filter "name=^${PREFIX}" --format "{{.Names}}|{{.Ports}}|{{.ID}}" | while IFS='|' read -r name ports id; do
+    local tag=$(get_tag "$name")
+    local ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$id" 2>/dev/null)
+    if [[ "${name,,}" == *"${keyword,,}"* ]] || [[ "${tag,,}" == *"${keyword,,}"* ]] || [[ "${ports,,}" == *"${keyword,,}"* ]] || [[ "${ip,,}" == *"${keyword,,}"* ]]; then
+       echo "║  - ${CYAN}${name#$PREFIX}${RESET} [Tag: ${YELLOW}${tag:-None}${RESET}] [Ports: $ports] [IP: $ip]"
+       found_c=1
+    fi
+  done
+  [ $found_c -eq 0 ] && echo "║    (none)"
+  
+  echo "║"
+  echo "║  [MATCHING NETWORKS]"
+  local found_n=0
+  docker network ls --filter "name=^${NET_PREFIX}" --format "{{.Name}}" | while read -r net; do
+    local tag=$(get_tag "$net")
+    local subnet=$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$net" 2>/dev/null)
+    if [[ "${net,,}" == *"${keyword,,}"* ]] || [[ "${tag,,}" == *"${keyword,,}"* ]] || [[ "${subnet,,}" == *"${keyword,,}"* ]]; then
+       echo "║  - ${CYAN}${net}${RESET} [Tag: ${YELLOW}${tag:-None}${RESET}] [Subnet: $subnet]"
+       found_n=1
+    fi
+  done
+  [ $found_n -eq 0 ] && echo "║    (none)"
+  
+  pause
+  tput civis
+}
+
+export_compose() {
+    local target_opts=("Export ALL services" "Select specific services" "Cancel")
+    select_menu target_opts "EXPORT TO DOCKER COMPOSE:"
+    if [ "$MENU_RESULT" -eq 2 ] || [ "$MENU_RESULT" -lt 0 ]; then return; fi
+    
+    local export_mode_opts=("For THIS machine (Absolute Paths, External Nets)" "For NEW machine (Named Volumes, Auto Nets)" "Cancel")
+    local selected_mode=$MENU_RESULT
+    
+    select_menu export_mode_opts "Export Mode:"
+    if [ "$MENU_RESULT" -eq 2 ] || [ "$MENU_RESULT" -lt 0 ]; then return; fi
+    local net_export_mode=$((MENU_RESULT + 1))
+    
+    local selected_ids=""
+    if [ "$selected_mode" -eq 0 ]; then
+        selected_ids=$(docker ps -a --filter "name=^${PREFIX}" --format "{{.ID}}")
+    else
+        # Allow multi-select using a loop (simple version: just ask for indices or select one by one, wait, we'll just export all or prompt text for multi)
+        tput cnorm
+        draw_header
+        local i=1
+        declare -a AVAIL_IDS
+        while IFS='|' read -r id name; do
+            echo "  $i) ${name#$PREFIX}"
+            AVAIL_IDS[$i]="$id"
+            ((i++))
+        done < <(docker ps -a --filter "name=^${PREFIX}" --format "{{.ID}}|{{.Names}}")
+        read -p "  Enter numbers to export (e.g. '1 3 4'): " selection
+        tput civis
+        for idx in $selection; do
+            [ -n "${AVAIL_IDS[$idx]}" ] && selected_ids="$selected_ids ${AVAIL_IDS[$idx]}"
+        done
+    fi
+    
+    if [ -z "$selected_ids" ]; then return; fi
+    
+    tput cnorm
+    read -e -p "  Enter destination folder: " -i "${HOME}/Projects/" dest_dir
+    mkdir -p "$dest_dir" 2>/dev/null || dest_dir="${HOME}/Downloads"
+    local dest_file="${dest_dir}/mkb-grid-compose.yml"
+    tput civis
+    
+    echo "version: '3.8'" > "$dest_file"
+    echo "services:" >> "$dest_file"
+    
+    declare -A NETWORKS_SEEN
+    declare -A VOLUMES_SEEN
+    
+    for id in $selected_ids; do
+        local name=$(docker inspect -f '{{.Name}}' "$id" | sed 's/^\///')
+        local image=$(docker inspect -f '{{.Config.Image}}' "$id")
+        local restart=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$id")
+        
+        echo "  ${name}:" >> "$dest_file"
+        echo "    image: ${image}" >> "$dest_file"
+        echo "    container_name: ${name}" >> "$dest_file"
+        [ -n "$restart" ] && echo "    restart: ${restart}" >> "$dest_file"
+        
+        local ports=$(docker inspect --format '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}:{{$p}}{{end}}{{end}}' "$id")
+        if [ -n "$ports" ]; then
+            echo "    ports:" >> "$dest_file"
+            for p in $ports; do
+                local host_p=$(echo $p | cut -d: -f1)
+                local int_p=$(echo $p | cut -d: -f2 | cut -d/ -f1)
+                echo "      - \"${host_p}:${int_p}\"" >> "$dest_file"
+            done
+        fi
+        
+        local envs=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$id" | grep -v '^PATH=' | grep -v '^HOSTNAME=')
+        if [ -n "$envs" ]; then
+            echo "    environment:" >> "$dest_file"
+            echo "$envs" | while read -r e; do echo "      - $e" >> "$dest_file"; done
+        fi
+        
+        local vols=$(docker inspect --format '{{range .Mounts}}{{println .Source ":" .Destination}}{{end}}' "$id")
+        if [ -n "$vols" ]; then
+            echo "    volumes:" >> "$dest_file"
+            echo "$vols" | while read -r v; do
+                local src=$(echo "$v" | cut -d: -f1)
+                local dst=$(echo "$v" | cut -d: -f2)
+                if [ "$net_export_mode" == "2" ] && [[ "$src" == *"/mkb-grid/volumes/"* ]]; then
+                   local vol_name="${name}_data"
+                   echo "      - ${vol_name}:${dst}" >> "$dest_file"
+                   VOLUMES_SEEN["$vol_name"]=1
+                else
+                   echo "      - ${src}:${dst}" >> "$dest_file"
+                fi
+            done
+        fi
+        
+        local nets=$(docker inspect --format '{{range $net, $conf := .NetworkSettings.Networks}}{{$net}} {{end}}' "$id" | xargs)
+        if [ -n "$nets" ] && [ "$nets" != "bridge" ]; then
+            echo "    networks:" >> "$dest_file"
+            for n in $nets; do
+                if [ "$n" != "bridge" ]; then
+                    echo "      - $n" >> "$dest_file"
+                    NETWORKS_SEEN["$n"]=1
+                fi
+            done
+        fi
+        echo "" >> "$dest_file"
+    done
+    
+    if [ ${#NETWORKS_SEEN[@]} -gt 0 ]; then
+        echo "networks:" >> "$dest_file"
+        for n in "${!NETWORKS_SEEN[@]}"; do
+            echo "  ${n}:" >> "$dest_file"
+            if [ "$net_export_mode" == "2" ]; then
+                echo "    name: ${n}" >> "$dest_file"
+                echo "    driver: bridge" >> "$dest_file"
+            else
+                echo "    external: true" >> "$dest_file"
+            fi
+        done
+    fi
+    
+    if [ ${#VOLUMES_SEEN[@]} -gt 0 ]; then
+        echo "volumes:" >> "$dest_file"
+        for v in "${!VOLUMES_SEEN[@]}"; do
+            echo "  ${v}:" >> "$dest_file"
+        done
+    fi
+    
+    draw_header
+    echo "║  [SUCCESS] Exported to $dest_file"
+    pause
+}
+
+# ─── MAIN MENU ───────────────────────────────────────────────────
+MAIN_OPTIONS=(
+    "Deploy New Service"
+    "Services Dashboard"
+    "Networks & Topology"
+    "Search / Filter"
+    "Export to docker-compose.yml"
+    "Exit"
+)
+
+tput civis
+while true; do
+    select_menu MAIN_OPTIONS ""
+    case "$MENU_RESULT" in
+        0) deploy_service ;;
+        1) services_dashboard ;;
+        2) manage_networks ;;
+        3) search_filter ;;
+        4) export_compose ;;
+        5|-1)
+            clear
+            tput cnorm
+            echo "Exiting MKB-GRID..."
+            exit 0
+            ;;
+    esac
+done
